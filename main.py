@@ -1,51 +1,24 @@
 import os
-import subprocess
-import shutil
-import discord
-import aiohttp
 import asyncio
+import aiohttp
+import discord
 import json
 import time
+import random
 from discord.ext import tasks
 from discord import app_commands
 from dotenv import load_dotenv
+import textwrap
 
 # -------------------------------
 # Load environment variables
 # -------------------------------
-load_dotenv()
+load_dotenv(dotenv_path="/mnt/data/.env")
 TOKEN = os.getenv("TOKEN")
 JTOKEN = os.getenv("JTOKEN") or "jscajkghfpvj2xmyml5hnytds6hlwfa6"
 
 # -------------------------------
-# Startup tasks
-# -------------------------------
-def update_pip():
-    try:
-        subprocess.run(["python3", "-m", "pip", "install", "--upgrade", "pip"], check=True)
-    except:
-        pass
-
-def cleanup_files():
-    folders = ["__pycache__", ".cache"]
-    exts = [".log", ".tmp", ".bak"]
-    for f in folders:
-        if os.path.exists(f):
-            try: shutil.rmtree(f)
-            except: pass
-    for file in os.listdir():
-        for e in exts:
-            if file.endswith(e):
-                try: os.remove(file)
-                except: pass
-
-def install_requirements():
-    try:
-        subprocess.run(["python3", "-m", "pip", "install", "discord.py", "aiohttp", "python-dotenv"], check=True)
-    except: pass
-
-# -------------------------------
-# Discord bot setup
+# Discord Bot setup
 # -------------------------------
 ROPROXY_USERS = "https://users.roproxy.com"
 ROPROXY_FRIENDS = "https://friends.roproxy.com"
@@ -55,94 +28,107 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
-global_limit = asyncio.Semaphore(20)
 
-cache = {}
-CACHE_DURATION = 300
+global_limit = asyncio.Semaphore(20)
+CACHE_DURATION = 300  # seconds
+cache = {}  # uid -> {"data":..., "ts":...}
+
+bot.session = None  # will be initialized on_ready
 
 # -------------------------------
 # Cache helpers
 # -------------------------------
-def encode_user_data(data): return json.dumps(data)
-def decode_user_data(data): return json.loads(data)
 def get_cache(uid):
-    if uid not in cache: return None
-    encoded, ts = cache[uid]
-    if time.time() - ts > CACHE_DURATION:
-        del cache[uid]; return None
-    return decode_user_data(encoded)
-def set_cache(uid, data): cache[uid] = (encode_user_data(data), time.time())
+    entry = cache.get(uid)
+    if not entry: 
+        return None
+    if time.time() - entry["ts"] > CACHE_DURATION:
+        cache.pop(uid, None)
+        return None
+    return entry["data"]
+
+def set_cache(uid, data):
+    cache[uid] = {"data": data, "ts": time.time()}
 
 # -------------------------------
-# JSONHost online storage
+# JSONHost helpers
 # -------------------------------
 async def jsonhost_get():
     url = "https://jsonhost.com/api/json/mason"
     headers = {"Authorization": JTOKEN}
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=headers) as r:
-                return await r.json() if r.status == 200 else None
-    except: return None
+        async with bot.session.get(url, headers=headers, timeout=10) as r:
+            if r.status == 200:
+                return await r.json()
+    except Exception as e:
+        print("JSONHost GET error:", e)
+    return None
 
 async def jsonhost_put(data):
     url = "https://jsonhost.com/api/json/mason"
     headers = {"Authorization": JTOKEN}
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.put(url, json=data, headers=headers) as r:
-                return r.status == 200
-    except: return False
+        async with bot.session.put(url, json=data, headers=headers, timeout=10) as r:
+            return r.status == 200
+    except Exception as e:
+        print("JSONHost PUT error:", e)
+    return False
 
 # -------------------------------
 # Roblox API fetchers
 # -------------------------------
-async def fetch_json(session, url, retries=3):
+async def fetch_json(url, retries=3):
     headers = {"User-Agent": "Mozilla/5.0"}
     for _ in range(retries):
         try:
-            async with session.get(url, headers=headers, timeout=10) as r:
-                if r.status == 200: return await r.json()
+            async with bot.session.get(url, headers=headers, timeout=10) as r:
+                if r.status == 200:
+                    return await r.json()
+        except Exception:
             await asyncio.sleep(1)
-        except: await asyncio.sleep(1)
     return None
 
 async def get_user_id(username):
-    if username.isdigit(): return int(username)
-    async with aiohttp.ClientSession() as s:
-        async with s.post(f"{ROPROXY_USERS}/v1/usernames/users", json={"usernames": [username]}) as r:
-            if r.status != 200: return None
-            data = await r.json()
-            try: return data["data"][0]["id"]
-            except: return None
+    if username.isdigit(): 
+        return int(username)
+    payload = {"usernames": [username]}
+    async with bot.session.post(f"{ROPROXY_USERS}/v1/usernames/users", json=payload) as r:
+        if r.status != 200: 
+            return None
+        data = await r.json()
+        try: 
+            return data["data"][0]["id"]
+        except:
+            return None
 
 async def get_full_user_data(uid):
     cached = get_cache(uid)
-    if cached: return cached
+    if cached: 
+        return cached
 
-    online = await jsonhost_get()
-    if online and str(uid) in online:
+    online = await jsonhost_get() or {}
+    if str(uid) in online:
         set_cache(uid, online[str(uid)])
         return online[str(uid)]
 
-    async with aiohttp.ClientSession() as s:
-        user = await fetch_json(s, f"{ROPROXY_USERS}/v1/users/{uid}")
-        friends = await fetch_json(s, f"{ROPROXY_FRIENDS}/v1/users/{uid}/friends/count")
-        avatar = await fetch_json(s, f"{ROPROXY_THUMB}/v1/users/avatar-headshot?userIds={uid}&size=420x420&format=Png")
-        if not user or not friends or not avatar: return None
+    user = await fetch_json(f"{ROPROXY_USERS}/v1/users/{uid}")
+    friends = await fetch_json(f"{ROPROXY_FRIENDS}/v1/users/{uid}/friends/count")
+    avatar = await fetch_json(f"{ROPROXY_THUMB}/v1/users/avatar-headshot?userIds={uid}&size=420x420&format=Png")
 
-        result = {
-            "name": user.get("name"),
-            "displayName": user.get("displayName"),
-            "userId": uid,
-            "description": user.get("description"),
-            "created": user.get("created"),
-            "friendCount": friends.get("count", 0),
-            "avatarUrl": avatar["data"][0]["imageUrl"]
-        }
+    if not user or not friends or not avatar: 
+        return None
+
+    result = {
+        "name": user.get("name"),
+        "displayName": user.get("displayName"),
+        "userId": uid,
+        "description": user.get("description"),
+        "created": user.get("created"),
+        "friendCount": friends.get("count", 0),
+        "avatarUrl": avatar["data"][0]["imageUrl"]
+    }
 
     set_cache(uid, result)
-    online = online or {}
     online[str(uid)] = result
     await jsonhost_put(online)
     return result
@@ -153,41 +139,39 @@ async def get_full_user_data(uid):
 @tasks.loop(minutes=5)
 async def clean_cache():
     now = time.time()
-    expired = [k for k, (_, ts) in cache.items() if now - ts > CACHE_DURATION]
-    for k in expired: del cache[k]
+    expired = [k for k, v in cache.items() if now - v["ts"] > CACHE_DURATION]
+    for k in expired: 
+        cache.pop(k, None)
 
 # -------------------------------
-# VisionOS Improved Layout
+# Discord command
 # -------------------------------
 @tree.command(name="user", description="Search Roblox user")
 async def roblox_user(interaction: discord.Interaction, username: str):
     async with global_limit:
         await interaction.response.defer()
         uid = await get_user_id(username)
-        if not uid: 
-            await interaction.followup.send("❌ User not found."); return
+        if not uid:
+            await interaction.followup.send("❌ User not found.")
+            return
 
         data = await get_full_user_data(uid)
-        if not data: 
-            await interaction.followup.send("❌ API error or Cloudflare blocked."); return
+        if not data:
+            await interaction.followup.send("❌ API error or Cloudflare blocked.")
+            return
 
-        # Format join date
-        created = data["created"]
-        join_date = created.split("T")[0] if created else "N/A"
+        # Join date
+        join_date = data["created"].split("T")[0] if data.get("created") else "N/A"
 
         # Premium check
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://premiumfeatures.roproxy.com/v1/users/{uid}/validate-membership") as r:
-                premium = await r.json() if r.status == 200 else {"isPremium": False}
-        premium_text = "● Premium Member" if premium.get("isPremium") else "○ Standard User"
+        premium_data = await fetch_json(f"https://premiumfeatures.roproxy.com/v1/users/{uid}/validate-membership")
+        is_premium = premium_data.get("isPremium") if premium_data else False
+        premium_text = "● Premium Member" if is_premium else "○ Standard User"
 
-        # Truncate description if too long
-        desc = data["description"] or "_No description_"
-        if len(desc) > 100: desc = desc[:97] + "…"
+        # Description
+        desc = textwrap.shorten(data.get("description") or "_No description_", width=100, placeholder="…")
 
-        # -------------------------------
-        # Embed Layout
-        # -------------------------------
+        # Embed
         embed = discord.Embed(
             title=f"{data['name']} — Roblox User",
             description=f"**{data['displayName']}**",
@@ -209,10 +193,30 @@ async def roblox_user(interaction: discord.Interaction, username: str):
                                                url=f"https://www.roblox.com/users/{uid}/profile"))
                 self.add_item(discord.ui.Button(label="🖼 Avatar Image", style=discord.ButtonStyle.link,
                                                url=data["avatarUrl"]))
-                self.add_item(discord.ui.Button(label="📋 Copy UserID", style=discord.ButtonStyle.secondary, 
+                self.add_item(discord.ui.Button(label="📋 Copy UserID", style=discord.ButtonStyle.secondary,
                                                disabled=True))
 
         await interaction.followup.send(embed=embed, view=VisionButtons())
+
+# -------------------------------
+# Background task: Random user fetch
+# -------------------------------
+SAMPLE_USERNAMES = [
+    "builderman", "roblox", "noobmaster", "user123", "gamer456",
+    "playerOne", "devTest", "exampleUser", "funnyCat", "coolDude"
+]
+
+async def random_user_search_task():
+    await bot.wait_until_ready()
+    while True:
+        username = random.choice(SAMPLE_USERNAMES)
+        async with global_limit:
+            uid = await get_user_id(username)
+            if uid:
+                data = await get_full_user_data(uid)
+                if data:
+                    print(f"Auto-fetched: {username} ({uid})")
+        await asyncio.sleep(100)  # 每 100 秒自動搜尋一次
 
 # -------------------------------
 # Bot ready
@@ -220,14 +224,23 @@ async def roblox_user(interaction: discord.Interaction, username: str):
 @bot.event
 async def on_ready():
     print("Bot is ready.")
+    bot.session = aiohttp.ClientSession()
     await tree.sync()
     clean_cache.start()
+    bot.loop.create_task(random_user_search_task())
 
 # -------------------------------
-# Start
+# Graceful shutdown
+# -------------------------------
+async def shutdown():
+    if bot.session:
+        await bot.session.close()
+
+# -------------------------------
+# Start bot
 # -------------------------------
 if __name__ == "__main__":
-    update_pip()
-    cleanup_files()
-    install_requirements()
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    finally:
+        asyncio.run(shutdown())
